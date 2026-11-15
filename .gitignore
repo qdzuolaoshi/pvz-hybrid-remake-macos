@@ -1,0 +1,9 @@
+# game files and build output are never committed
+*.pck
+*.exe
+*.zip
+*.app/
+out/
+build/
+tools/deflate64/inflate64
+.DS_Store

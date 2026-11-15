@@ -45,7 +45,7 @@ python3 tools/deflate64/unzip64.py <游戏压缩包.zip> <解压目录> tools/de
 python3 hybrid_mac/pck_patch.py extract <游戏目录>/*.pck icon.png icon.png
 
 # 3) 构建（加 --install 会装进「应用程序」）
-ICONPNG=icon.png ./build_hybrid_app.sh <游戏目录> <macos_template.app> <dotnet-runtime 目录> <输出目录> [--install]
+ICONPNG=icon.png zsh build_hybrid_app.sh <游戏目录> <macos_template.app> <dotnet-runtime 目录> <输出目录> [--install]
 ```
 
 脚本会：把引擎精简为 arm64；复制 .NET 运行库和游戏程序集；生成一份打过补丁的资源包副本（你的原始 `.pck` 只读不改）；编译启动器和辅助库；ad-hoc 签名。

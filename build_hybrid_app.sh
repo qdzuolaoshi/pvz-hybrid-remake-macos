@@ -5,7 +5,7 @@
 # one shader fix, two small GDScript add-ons and an override.cfg are appended by hybrid_mac/pck_patch.py (see
 # "Game data" below).
 #
-# usage: ./build_hybrid_app.sh <game_dir> <template_app> <dotnet_runtime_dir> <out_dir> [--install]
+# usage: zsh build_hybrid_app.sh <game_dir> <template_app> <dotnet_runtime_dir> <out_dir> [--install]
 #   game_dir            extracted Windows game folder (contains *.pck and data_PlantsVsZombies_windows_x86_64/)
 #   template_app        macos_template.app from Godot_v4.7-stable_mono_export_templates.tpz (templates/macos.zip)
 #                       https://github.com/godotengine/godot-builds/releases/download/4.7-stable/ (SHA512-SUMS.txt)

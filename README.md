@@ -24,6 +24,7 @@
 | 鼠标停在卡槽上不显示植物名 | 原作没有这个功能 | 可选的 `packet_name_tooltip.gd` |
 | 动画卡顿 | 游戏「选项 > 动画帧率」默认 30；垂直同步关闭 | 打开垂直同步；在游戏里把动画帧率调到 60 |
 | 窗口可以被拉成任意比例 | Godot 没有窗口比例锁定 | 启动器 `launcher.c` + 注入库 `PvzHybridMac.m`（`contentAspectRatio`），窗口只能等比例缩放，全屏不受影响 |
+| 游戏里的白色大箭头指针几乎不出现，移动时和 Mac 黑色指针交替闪烁 | 游戏只在指针形状变化时设置一次自定义指针；macOS 的跟踪区域、窗口激活会换回系统箭头，窗口服务器有时还会绕过 App 直接换回箭头；游戏还会在多个外观相同的指针对象之间来回切换 | 注入库 `PvzHybridMac.m`：指针在游戏画面内时，把系统换指针的请求直接替换成游戏指针；监视窗口服务器的指针序号（`CGSCurrentCursorSeed`），被换掉就立刻补回；外观相同的指针合并成同一个对象。窗口边缘的缩放指针不受影响；`PVZH_NO_CURSOR_KEEP=1` 可关闭 |
 
 详细原理和排查方法见 [docs/PORTING_GUIDE.md](docs/PORTING_GUIDE.md)（英文）。
 
@@ -64,4 +65,4 @@ ICONPNG=icon.png zsh build_hybrid_app.sh <游戏目录> <macos_template.app> <do
 
 ## English summary
 
-Build scripts and fixes that turn the Windows release of the fan remake *植物大战僵尸杂交重制版* (Godot 4.7, C#/.NET 9) into a native Apple Silicon macOS app. **No game files are included**; you need your own copy of the game. The game's pack and managed assemblies are reused; the Windows engine and .NET runtime are replaced with the official macOS ones; Apple-GPU and macOS-specific problems are fixed (Deflate64 archives, x64-only IL assembly, deps.json, a float bit-decoding bug in the character shader, silent buttons, an optional seed-packet tooltip, vsync, a windowed aspect lock). See [docs/PORTING_GUIDE.md](docs/PORTING_GUIDE.md).
+Build scripts and fixes that turn the Windows release of the fan remake *植物大战僵尸杂交重制版* (Godot 4.7, C#/.NET 9) into a native Apple Silicon macOS app. **No game files are included**; you need your own copy of the game. The game's pack and managed assemblies are reused; the Windows engine and .NET runtime are replaced with the official macOS ones; Apple-GPU and macOS-specific problems are fixed (Deflate64 archives, x64-only IL assembly, deps.json, a float bit-decoding bug in the character shader, silent buttons, an optional seed-packet tooltip, vsync, a windowed aspect lock, a cursor keeper so the game's white arrow stays on screen instead of flickering with the system arrow). See [docs/PORTING_GUIDE.md](docs/PORTING_GUIDE.md).

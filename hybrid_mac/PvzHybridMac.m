@@ -721,6 +721,9 @@ static NSWindow *FindMainWindow(void)
 
 static void InstallViewTrace(NSView *view);
 static bool gTraceOn;
+static void InstallCursorKeeperSwizzle(void);
+static void InstallCursorKeeperView(NSWindow *w);
+static void KeepCursor(void);
 
 static void Tick(void)
 {
@@ -751,11 +754,13 @@ static void Tick(void)
 		if (!gLockDisabled)
 			[[NSNotificationCenter defaultCenter] addObserver:gObserver selector:@selector(windowWillClose:)
 				name:NSWindowWillCloseNotification object:w];
+		InstallCursorKeeperView(w);
 		if (gTraceOn)
 			InstallViewTrace([w contentView]);
 		return;
 	}
 	AspectUpdate();
+	KeepCursor();
 }
 
 static int gBootTries;
@@ -780,6 +785,276 @@ static void Bootstrap(void)
 		Tick();
 	}];
 	[[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
+}
+
+#pragma mark - Cursor keeper
+
+// The game uses custom cursors (the white enlarged arrow from addons/awesome_custom_cursor, set through Godot's
+// Input.set_custom_mouse_cursor -> -[NSCursor set] in DisplayServerMacOS). On macOS, AppKit's tracking-area and window
+// cursor handling switches the displayed cursor back to the system arrow afterwards, while Godot only calls -set again
+// when the shape changes, so the white arrow showed only as a brief flicker on shape changes (seed packets, almanac).
+// The keeper remembers the cursor Godot itself last set (a -set called directly from the engine binary) and, while the
+// pointer is inside the game window's content, substitutes it synchronously for any other cursor AppKit tries to set
+// (inset, so AppKit's window-edge resize cursors are left alone; not while the window is inactive or being resized).
+// PVZH_NO_CURSOR_KEEP=1 turns it off.
+// Two more things defeat a plain -set (both seen in a diagnostic run with a sampler of the displayed cursor):
+//  1. The window server shows the system arrow again on its own, without any NSCursor call in the app, for example
+//     when the app finishes activating. AppKit still believes the game's cursor is current, so -set returns early and
+//     the arrow stays until the cursor shape changes. The keeper therefore watches the window server's cursor seed
+//     (CGSCurrentCursorSeed, bumped on every displayed-cursor change) and, when it moved without the keeper's own
+//     cursor reaching the screen, re-sends the game's cursor with -forceSet.
+//  2. Godot keeps one NSCursor per cursor shape, and the addon gives several shapes the same picture. Moving across
+//     controls with different shapes switched the displayed cursor between identical-looking objects many times a
+//     second. Engine cursors are folded onto one object per picture and hotspot, so those switches no longer reach the
+//     window server.
+// While AppKit shows a window-edge resize override cursor (+_setOverrideCursor:type: with a cursor) the keeper stays
+// out of the way, so the resize cursors at the window border keep working.
+typedef void (*CursorSetFn)(id, SEL);
+typedef void (*OverrideFn)(id, SEL, id, long);
+typedef int (*CursorSeedFn)(void);
+static CursorSetFn gOrigCursorSet, gOrigReallySet, gOrigForceSet;
+static OverrideFn gOrigSetOverride;
+static CursorSeedFn gCursorSeed;
+static NSCursor *gWantedCursor;
+static bool gCursorKeepOff;
+static bool gOverrideActive;		// AppKit override cursor (edge resize, split-view divider) on screen
+static long gOverrideType;
+static int gShownSeed = -1;			// window-server cursor seed right after the game's cursor last reached the screen
+static long gRestores;
+static const void *gMainBase;
+static NSMutableArray<NSCursor *> *gCanonical;	// one engine cursor per distinct picture + hotspot
+static char gFingerprintKey;
+
+static bool CalledFromEngine(void *returnAddress)
+{
+	Dl_info info;
+	return gMainBase != NULL && dladdr(returnAddress, &info) && info.dli_fbase == gMainBase;
+}
+
+static bool PointerInGameContent(void)
+{
+	NSWindow *w = gWindow;
+	if (w == nil || ![NSApp isActive] || ![w isKeyWindow] || [w inLiveResize])
+		return false;
+	if ([w isMiniaturized])
+		return false;
+	NSView *content = [w contentView];
+	if (content == nil)
+		return false;
+	const NSPoint inWindow = [w mouseLocationOutsideOfEventStream];
+	const NSPoint p = [content convertPoint:inWindow fromView:nil];
+	// Windowed: leave a 6 pt border to AppKit's window-edge resize cursors. Fullscreen has no resize border, and an inset
+	// would only leave a strip along the screen edges where the system arrow could stay.
+	const CGFloat inset = ([w styleMask] & NSWindowStyleMaskFullScreen) != 0 ? 0.0 : 6.0;
+	const NSRect inner = NSInsetRect([content bounds], inset, inset);
+	if (!NSPointInRect(p, inner))
+		return false;
+	// Not when another window (a panel, notification or another app's window) is over the game at that point.
+	return [NSWindow windowNumberAtPoint:[NSEvent mouseLocation] belowWindowWithWindowNumber:0] == [w windowNumber];
+}
+
+static NSData *CursorFingerprint(NSCursor *c)
+{
+	NSData *fp = objc_getAssociatedObject(c, &gFingerprintKey);
+	if (fp != nil)
+		return fp;
+	NSMutableData *d = [NSMutableData data];
+	const NSPoint hot = [c hotSpot];
+	const NSSize size = [[c image] size];
+	const double head[4] = {hot.x, hot.y, size.width, size.height};
+	[d appendBytes:head length:sizeof head];
+	NSData *tiff = [[c image] TIFFRepresentation];
+	if (tiff != nil)
+		[d appendData:tiff];
+	objc_setAssociatedObject(c, &gFingerprintKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	return d;
+}
+
+// The first engine cursor seen with this picture and hotspot (a custom cursor from Godot is only replaced by another
+// object when its image changes, so the list stays a handful long).
+static NSCursor *CanonicalCursor(NSCursor *c)
+{
+	if (gCanonical == nil)
+		gCanonical = [NSMutableArray array];
+	NSData *fp = CursorFingerprint(c);
+	for (NSCursor *k in gCanonical)
+		if (k == c || [CursorFingerprint(k) isEqualToData:fp])
+			return k;
+	if ([gCanonical count] >= 64)
+		[gCanonical removeObjectAtIndex:0];
+	[gCanonical addObject:c];
+	return c;
+}
+
+static void NoteShown(id cursor)
+{
+	if (cursor == gWantedCursor && gCursorSeed != NULL)
+		gShownSeed = gCursorSeed();
+}
+
+// Re-send the game's cursor when the window server is showing something else (seed moved since the game's cursor last
+// reached the screen) while the pointer is over the game.
+// -forceSet is only [self set] on current AppKit, so the restore re-enters PvzhCursorSet (which calls KeepCursor), and
+// while an AppKit override cursor is active -set only records the cursor without reaching the window server. Hence the
+// re-entrancy guard and recording the seed before the restore: a restore AppKit suppresses is not repeated.
+static void KeepCursor(void)
+{
+	static bool busy;
+	if (busy || gCursorKeepOff || gWantedCursor == nil || gOrigForceSet == NULL || gCursorSeed == NULL || gOverrideActive)
+		return;
+	if (gCursorSeed() == gShownSeed || !PointerInGameContent())
+		return;
+	busy = true;
+	gShownSeed = gCursorSeed();
+	gOrigForceSet(gWantedCursor, NSSelectorFromString(@"forceSet"));
+	gShownSeed = gCursorSeed();
+	busy = false;
+	if (gLog && (++gRestores <= 20 || gRestores % 100 == 0))
+		Log("cursor: window server showed another cursor over the game, restored (%ld)", gRestores);
+}
+
+static bool SubstituteCursor(id self)
+{
+	return !gCursorKeepOff && !gOverrideActive && gWantedCursor != nil && self != gWantedCursor &&
+		PointerInGameContent();
+}
+
+// AppKit also changes the cursor below -set: cursor-rect and tracking-area code and +_clearOverrideCursorAndSetArrow call
+// the private -_reallySet (and -forceSet) directly. Guard those too. The engine's own -set passes through here with
+// self == gWantedCursor.
+static void PvzhCursorReallySet(id self, SEL _cmd)
+{
+	if (SubstituteCursor(self))
+		self = gWantedCursor;
+	gOrigReallySet(self, _cmd);
+	NoteShown(self);
+}
+
+static void PvzhCursorForceSet(id self, SEL _cmd)
+{
+	if (SubstituteCursor(self))
+		self = gWantedCursor;
+	gOrigForceSet(self, _cmd);
+	NoteShown(self);
+}
+
+// Mirrors AppKit's rule (+[NSCursor _setOverrideCursor:type:]): a cursor always installs the override; nil clears it only
+// for type 0 or the type that installed it (edge resizing uses 1 on every mouse move, the split-view divider 2).
+static void PvzhSetOverrideCursor(id self, SEL _cmd, id cursor, long type)
+{
+	if (cursor != nil)
+	{
+		gOverrideActive = true;
+		gOverrideType = type;
+	}
+	else if (type == 0 || type == gOverrideType)
+	{
+		gOverrideActive = false;
+		gOverrideType = 0;
+	}
+	gOrigSetOverride(self, _cmd, cursor, type);
+	if (!gOverrideActive)
+		KeepCursor();
+}
+
+static void PvzhCursorSet(id self, SEL _cmd)
+{
+	const bool fromEngine = CalledFromEngine(__builtin_return_address(0));
+	if (fromEngine)
+	{
+		NSCursor *c = CanonicalCursor((NSCursor *)self);
+		if (gWantedCursor != c)
+		{
+			gWantedCursor = c;
+			if (gLog)
+				Log("cursor: engine set %.0fx%.0f cursor", [[c image] size].width, [[c image] size].height);
+		}
+		self = c;
+	}
+	else if (gLog)
+		Log("cursor: AppKit set %.0fx%.0f cursor", [[(NSCursor *)self image] size].width,
+			[[(NSCursor *)self image] size].height);
+	if (!fromEngine && SubstituteCursor(self))
+	{
+		// AppKit tries to reset the cursor (tracking areas / cursor rects on mouse moves, key-window changes) while the
+		// pointer is over the game: show the game's cursor instead of letting the system arrow through for a frame.
+		// Correcting it afterwards (the first version) made both cursors flicker while the mouse moved.
+		self = gWantedCursor;
+	}
+	gOrigCursorSet(self, _cmd);
+	KeepCursor();
+}
+
+typedef void (*ViewEventFn)(id, SEL, NSEvent *);
+static ViewEventFn gOrigMoved, gOrigDragged, gOrigCursorUpdate, gOrigEntered;
+static void PvzhViewMoved(id self, SEL _cmd, NSEvent *e) { if (gOrigMoved) gOrigMoved(self, _cmd, e); KeepCursor(); }
+static void PvzhViewDragged(id self, SEL _cmd, NSEvent *e) { if (gOrigDragged) gOrigDragged(self, _cmd, e); KeepCursor(); }
+static void PvzhViewCursorUpdate(id self, SEL _cmd, NSEvent *e) { if (gOrigCursorUpdate) gOrigCursorUpdate(self, _cmd, e); KeepCursor(); }
+static void PvzhViewEntered(id self, SEL _cmd, NSEvent *e) { if (gOrigEntered) gOrigEntered(self, _cmd, e); KeepCursor(); }
+
+static void HookViewSelector(Class cls, SEL sel, IMP replacement, ViewEventFn *orig)
+{
+	Method m = class_getInstanceMethod(cls, sel);
+	if (m == NULL)
+		return;
+	*orig = (ViewEventFn)method_getImplementation(m);
+	// Add on the concrete class (the method may be inherited); replace if the class defines it itself.
+	if (!class_addMethod(cls, sel, replacement, method_getTypeEncoding(m)))
+		*orig = (ViewEventFn)class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(m));
+}
+
+static void InstallCursorKeeperSwizzle(void)
+{
+	const char *off = getenv("PVZH_NO_CURSOR_KEEP");
+	gCursorKeepOff = off != NULL && atoi(off) != 0;
+	if (gCursorKeepOff)
+		return;
+	// The engine image is the one MH_EXECUTE image (image index 0 is not reliable with DYLD_INSERT_LIBRARIES).
+	for (uint32_t i = 0; i < _dyld_image_count(); i++)
+	{
+		const struct mach_header *h = _dyld_get_image_header(i);
+		if (h != NULL && h->filetype == MH_EXECUTE)
+		{
+			gMainBase = h;
+			break;
+		}
+	}
+	Method m = class_getInstanceMethod([NSCursor class], @selector(set));
+	if (m != NULL)
+		gOrigCursorSet = (CursorSetFn)method_setImplementation(m, (IMP)PvzhCursorSet);
+	m = class_getInstanceMethod([NSCursor class], NSSelectorFromString(@"_reallySet"));
+	if (m != NULL)
+		gOrigReallySet = (CursorSetFn)method_setImplementation(m, (IMP)PvzhCursorReallySet);
+	m = class_getInstanceMethod([NSCursor class], NSSelectorFromString(@"forceSet"));
+	if (m != NULL)
+		gOrigForceSet = (CursorSetFn)method_setImplementation(m, (IMP)PvzhCursorForceSet);
+	m = class_getClassMethod([NSCursor class], NSSelectorFromString(@"_setOverrideCursor:type:"));
+	if (m != NULL)
+		gOrigSetOverride = (OverrideFn)method_setImplementation(m, (IMP)PvzhSetOverrideCursor);
+	gCursorSeed = (CursorSeedFn)dlsym(RTLD_DEFAULT, "CGSCurrentCursorSeed");
+	if (gCursorSeed == NULL)
+		Log("cursor: CGSCurrentCursorSeed not found, window-server resets are not repaired");
+}
+
+static void InstallCursorKeeperView(NSWindow *w)
+{
+	static bool installed;
+	if (installed || gCursorKeepOff || w == nil || [w contentView] == nil)
+		return;
+	installed = true;
+	Class cls = [[w contentView] class];
+	HookViewSelector(cls, @selector(mouseMoved:), (IMP)PvzhViewMoved, &gOrigMoved);
+	HookViewSelector(cls, @selector(mouseDragged:), (IMP)PvzhViewDragged, &gOrigDragged);
+	HookViewSelector(cls, @selector(cursorUpdate:), (IMP)PvzhViewCursorUpdate, &gOrigCursorUpdate);
+	HookViewSelector(cls, @selector(mouseEntered:), (IMP)PvzhViewEntered, &gOrigEntered);
+	// The 50 ms Tick is too slow to hide a window-server reset while the pointer rests; check the seed every 8 ms
+	// (one shared-memory read when nothing changed).
+	NSTimer *t = [NSTimer timerWithTimeInterval:0.008 repeats:YES block:^(NSTimer *timer) {
+		(void)timer;
+		KeepCursor();
+	}];
+	[[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+	Log("cursor keeper on (%s)", class_getName(cls));
 }
 
 #pragma mark - Test driver (PVZH_TEST_SCRIPT only)
@@ -1393,6 +1668,7 @@ __attribute__((constructor)) static void PvzhInit(void)
 	gLockDisabled = noLock != NULL && atoi(noLock) != 0;
 	Log("libPvzHybridMac loaded (pid %d, test driver %s, aspect lock %s)", getpid(), gTest ? "on" : "off",
 		gLockDisabled ? "off" : "on");
+	InstallCursorKeeperSwizzle();
 	dispatch_async(dispatch_get_main_queue(), ^{
 		Bootstrap();
 	});

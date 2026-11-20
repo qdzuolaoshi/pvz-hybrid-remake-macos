@@ -31,7 +31,7 @@
 ## 需要准备
 
 - Apple Silicon Mac，macOS 11 或更高；Xcode Command Line Tools（`clang`、`codesign`）；Python 3。
-- Windows 版游戏（已测试 0.31、0.32），解压后的文件夹里有 `*.pck` 和 `data_PlantsVsZombies_windows_x86_64/`。
+- Windows 版游戏（已测试 0.31、0.32、0.32.1），解压后的文件夹里有 `*.pck` 和 `data_PlantsVsZombies_windows_x86_64/`。
 - 官方 Godot 4.7-stable mono 导出模板：`Godot_v4.7-stable_mono_export_templates.tpz`（[godotengine/godot-builds](https://github.com/godotengine/godot-builds/releases/tag/4.7-stable)，用 SHA512-SUMS.txt 校验），取出其中的 `templates/macos.zip` 并解压，得到 `macos_template.app`。
 - 微软官方 .NET 运行库：`dotnet-runtime-9.0.22-osx-arm64.tar.gz`（builds.dotnet.microsoft.com），解压到一个文件夹。
 
